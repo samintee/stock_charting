@@ -1,17 +1,18 @@
-import yfinance as yf
-import os
-from datetime import datetime, timedelta
+"""CLI to download OHLCV data from yfinance into data/."""
 
+from __future__ import annotations
 
-TIMEFRAME_OPTIONS = {
-    "1": ("1 month", 30),
-    "2": ("3 months", 90),
-    "3": ("6 months", 180),
-    "4": ("1 year", 365),
-    "5": ("2 years", 730),
-    "6": ("5 years", 1825),
-    "7": ("custom", None),
-}
+import argparse
+import sys
+from datetime import datetime
+
+from data_utils import (
+    CLI_TIMEFRAME_CHOICES,
+    INTERVAL_OPTIONS,
+    fetch_history,
+    resolve_date_range,
+    save_csv,
+)
 
 
 def get_ticker() -> str:
@@ -22,28 +23,33 @@ def get_ticker() -> str:
         print("Ticker cannot be empty. Please try again.")
 
 
+def get_interval() -> str:
+    print("\nSelect interval:")
+    for i, interval in enumerate(INTERVAL_OPTIONS, start=1):
+        print(f"  {i}. {interval}")
+    while True:
+        choice = input(f"Enter choice (1-{len(INTERVAL_OPTIONS)}) [1]: ").strip() or "1"
+        if choice.isdigit() and 1 <= int(choice) <= len(INTERVAL_OPTIONS):
+            return INTERVAL_OPTIONS[int(choice) - 1]
+        print("Invalid choice.")
+
+
 def get_timeframe() -> tuple[str, str]:
     print("\nSelect timeframe:")
-    for key, (label, _) in TIMEFRAME_OPTIONS.items():
+    for key, (label, _) in CLI_TIMEFRAME_CHOICES.items():
         print(f"  {key}. {label}")
 
     while True:
         choice = input("Enter choice (1-7): ").strip()
-        if choice not in TIMEFRAME_OPTIONS:
+        if choice not in CLI_TIMEFRAME_CHOICES:
             print("Invalid choice. Please enter a number between 1 and 7.")
             continue
 
-        label, days = TIMEFRAME_OPTIONS[choice]
-
-        if choice == "7":
+        _, preset = CLI_TIMEFRAME_CHOICES[choice]
+        if preset == "Custom":
             start, end = get_custom_dates()
-        else:
-            end = datetime.today()
-            start = end - timedelta(days=days)
-            start = start.strftime("%Y-%m-%d")
-            end = end.strftime("%Y-%m-%d")
-
-        return start, end
+            return start, end
+        return resolve_date_range(preset)
 
 
 def get_custom_dates() -> tuple[str, str]:
@@ -54,49 +60,81 @@ def get_custom_dates() -> tuple[str, str]:
             datetime.strptime(start, date_fmt)
             end = input("  End date   (YYYY-MM-DD): ").strip()
             datetime.strptime(end, date_fmt)
-            if start >= end:
-                print("  Start date must be before end date.")
-                continue
-            return start, end
-        except ValueError:
-            print("  Invalid date format. Use YYYY-MM-DD.")
+            return resolve_date_range("Custom", start, end)
+        except ValueError as exc:
+            print(f"  {exc}")
 
 
-def fetch_data(ticker: str, start: str, end: str):
-    print(f"\nFetching {ticker} daily data from {start} to {end}...")
-    stock = yf.Ticker(ticker)
-    df = stock.history(start=start, end=end, interval="1d", auto_adjust=True)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download stock OHLCV data from yfinance into data/.",
+    )
+    parser.add_argument("ticker", nargs="?", help="Ticker symbol (e.g. AAPL). Omit for prompts.")
+    parser.add_argument(
+        "--preset",
+        choices=[p for _, p in CLI_TIMEFRAME_CHOICES.values() if p != "Custom"],
+        help="Lookback preset using calendar DateOffsets (same as the chart app).",
+    )
+    parser.add_argument("--start", help="Start date YYYY-MM-DD (use with --end).")
+    parser.add_argument("--end", help="End date YYYY-MM-DD (use with --start).")
+    parser.add_argument(
+        "--interval",
+        choices=INTERVAL_OPTIONS,
+        default=None,
+        help="Bar interval (default: 1d, or prompted interactively).",
+    )
+    return parser
 
+
+def resolve_from_args(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    ticker = (args.ticker or "").strip().upper()
+    if not ticker:
+        ticker = get_ticker()
+
+    if args.start or args.end:
+        if not (args.start and args.end):
+            raise SystemExit("Provide both --start and --end for a custom range.")
+        start, end = resolve_date_range("Custom", args.start, args.end)
+    elif args.preset:
+        start, end = resolve_date_range(args.preset)
+    elif args.ticker:
+        # Non-interactive partial args: default to 1Y
+        start, end = resolve_date_range("1Y")
+    else:
+        start, end = get_timeframe()
+
+    if args.interval:
+        interval = args.interval
+    elif args.ticker:
+        interval = "1d"
+    else:
+        interval = get_interval()
+
+    return ticker, start, end, interval
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    print("=== Stock Data Fetcher ===\n")
+    try:
+        ticker, start, end, interval = resolve_from_args(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Fetching {ticker} ({interval}) from {start} to {end}...")
+    df = fetch_history(ticker, start, end, interval=interval)
     if df.empty:
         print(f"No data returned for '{ticker}'. Check the ticker symbol and date range.")
-        return None
+        return 1
 
-    df.index = df.index.tz_localize(None)
-    df.index.name = "Date"
-    df.index = df.index.strftime("%Y-%m-%d")
-    return df
-
-
-def save_csv(df, ticker: str, start: str, end: str) -> str:
-    filename = f"{ticker}_{start}_{end}.csv"
-    output_path = os.path.join(os.path.dirname(__file__), filename)
-    df.to_csv(output_path)
-    return output_path
-
-
-def main():
-    print("=== Stock Data Fetcher ===\n")
-    ticker = get_ticker()
-    start, end = get_timeframe()
-
-    df = fetch_data(ticker, start, end)
-    if df is None:
-        return
-
-    path = save_csv(df, ticker, start, end)
+    path = save_csv(df, ticker, start, end, interval=interval)
     print(f"\nSaved {len(df)} rows to: {path}")
     print(df[["Open", "High", "Low", "Close", "Volume"]].tail(5).to_string())
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
