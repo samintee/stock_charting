@@ -10,17 +10,62 @@ from data_utils import (
     CLI_TIMEFRAME_CHOICES,
     INTERVAL_OPTIONS,
     fetch_history,
+    looks_like_ticker,
     resolve_date_range,
+    resolve_ticker_query,
     save_csv,
 )
 
 
+def pick_from_candidates(query: str, candidates: list) -> str | None:
+    print(f"\nMultiple matches for “{query}”:")
+    for i, match in enumerate(candidates, start=1):
+        print(f"  {i}. {match.label}")
+    print("  0. Cancel")
+    while True:
+        choice = input(f"Select 1-{len(candidates)}: ").strip()
+        if choice == "0":
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+            return candidates[int(choice) - 1].symbol
+        print("Invalid choice.")
+
+
+def resolve_query_to_ticker(query: str) -> str | None:
+    """Resolve a ticker or company name; prompt when several matches exist."""
+    q = query.strip()
+    if not q:
+        return None
+    try:
+        resolved, candidates = resolve_ticker_query(q)
+    except RuntimeError as exc:
+        print(f"  {exc}")
+        if looks_like_ticker(q):
+            return q.upper()
+        return None
+
+    if resolved:
+        if resolved.label != resolved.symbol:
+            print(f"Resolved: {resolved.label}")
+        return resolved.symbol
+    if candidates:
+        return pick_from_candidates(q, candidates)
+    if looks_like_ticker(q):
+        return q.upper()
+    print(f"No ticker found for “{q}”.")
+    return None
+
+
 def get_ticker() -> str:
     while True:
-        ticker = input("Enter stock ticker symbol (e.g. AAPL): ").strip().upper()
+        query = input("Enter ticker or company name (e.g. AAPL or Apple): ").strip()
+        if not query:
+            print("Input cannot be empty. Please try again.")
+            continue
+        ticker = resolve_query_to_ticker(query)
         if ticker:
             return ticker
-        print("Ticker cannot be empty. Please try again.")
+        print("Please try again.")
 
 
 def get_interval() -> str:
@@ -69,7 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download stock OHLCV data from yfinance into data/.",
     )
-    parser.add_argument("ticker", nargs="?", help="Ticker symbol (e.g. AAPL). Omit for prompts.")
+    parser.add_argument(
+        "ticker",
+        nargs="?",
+        help="Ticker symbol or company name (e.g. AAPL or Apple). Omit for prompts.",
+    )
     parser.add_argument(
         "--preset",
         choices=[p for _, p in CLI_TIMEFRAME_CHOICES.values() if p != "Custom"],
@@ -87,8 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_from_args(args: argparse.Namespace) -> tuple[str, str, str, str]:
-    ticker = (args.ticker or "").strip().upper()
-    if not ticker:
+    raw_query = (args.ticker or "").strip()
+    if raw_query:
+        ticker = resolve_query_to_ticker(raw_query)
+        if not ticker:
+            raise SystemExit(f"Could not resolve ticker for “{raw_query}”.")
+    else:
         ticker = get_ticker()
 
     if args.start or args.end:

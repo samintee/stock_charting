@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -59,10 +61,115 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 # Backward-compatible alias used by older imports
 MA_COLORS = SMA_COLORS
 
+# Yahoo symbols like AAPL, BRK-B, BRK.B, ^GSPC — not multi-word company names
+_TICKER_RE = re.compile(r"^\^?[A-Za-z]{1,10}([.-][A-Za-z0-9]{1,4})?$")
+
+
+@dataclass(frozen=True)
+class TickerMatch:
+    symbol: str
+    name: str = ""
+    exchange: str = ""
+    quote_type: str = ""
+
+    @property
+    def label(self) -> str:
+        name = self.name or self.symbol
+        if self.exchange:
+            return f"{name} — {self.symbol} ({self.exchange})"
+        return f"{name} — {self.symbol}"
+
 
 def ensure_data_dir() -> Path:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return DATA_DIR
+
+
+def looks_like_ticker(query: str) -> bool:
+    """True when the query is a single token that resembles a Yahoo symbol."""
+    q = query.strip()
+    if not q or any(ch.isspace() for ch in q):
+        return False
+    return bool(_TICKER_RE.fullmatch(q))
+
+
+def search_tickers(query: str, *, max_results: int = 8) -> list[TickerMatch]:
+    """Search Yahoo Finance for tickers matching a symbol or company name."""
+    q = query.strip()
+    if not q:
+        return []
+    try:
+        raw = yf.Search(q, max_results=max_results, news_count=0).quotes or []
+    except Exception as exc:
+        raise RuntimeError(f"Ticker search failed: {exc}") from exc
+
+    seen: set[str] = set()
+    matches: list[TickerMatch] = []
+    for quote in raw:
+        symbol = str(quote.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        key = symbol.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        name = (
+            str(quote.get("longname") or quote.get("shortname") or "").strip()
+        )
+        matches.append(
+            TickerMatch(
+                symbol=symbol.upper() if symbol.isascii() else symbol,
+                name=name,
+                exchange=str(quote.get("exchange") or "").strip(),
+                quote_type=str(quote.get("quoteType") or "").strip(),
+            )
+        )
+    return matches
+
+
+def resolve_ticker_query(
+    query: str,
+    *,
+    max_results: int = 8,
+) -> tuple[TickerMatch | None, list[TickerMatch]]:
+    """
+    Resolve a ticker symbol or company name.
+
+    Returns (resolved, candidates):
+    - resolved set when there is an exact symbol match, a single candidate,
+      or a single clear primary equity listing (symbol with no '.' suffix)
+    - resolved None with candidates when the user should pick
+    - both empty when nothing useful was found (caller may fall back for
+      ticker-shaped queries)
+    """
+    q = query.strip()
+    if not q:
+        return None, []
+
+    candidates = search_tickers(q, max_results=max_results)
+    if not candidates:
+        return None, []
+
+    upper = q.upper()
+    for match in candidates:
+        if match.symbol.upper() == upper:
+            return match, candidates
+
+    if len(candidates) == 1:
+        return candidates[0], candidates
+
+    # Company-name searches often return many foreign listings of the same firm.
+    # If exactly one "primary" equity (no '.' exchange suffix) appears, use it.
+    primary = [
+        m
+        for m in candidates
+        if "." not in m.symbol
+        and (not m.quote_type or m.quote_type.upper() == "EQUITY")
+    ]
+    if len(primary) == 1:
+        return primary[0], candidates
+
+    return None, candidates
 
 
 def _drop_extra_columns(df: pd.DataFrame) -> pd.DataFrame:

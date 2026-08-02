@@ -20,8 +20,10 @@ from data_utils import (
     filter_timeframe,
     guess_ticker_from_filename,
     load_csv,
+    looks_like_ticker,
     resample_weekly,
     resolve_date_range,
+    resolve_ticker_query,
     save_csv,
 )
 
@@ -39,6 +41,22 @@ def cached_load_csv(name: str, raw: bytes) -> pd.DataFrame:
 @st.cache_data(show_spinner="Fetching market data…")
 def cached_fetch(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
     return fetch_history(ticker, start, end, interval=interval)
+
+
+@st.cache_data(show_spinner="Looking up symbol…")
+def cached_resolve_ticker(query: str) -> tuple[dict | None, list[dict]]:
+    resolved, candidates = resolve_ticker_query(query)
+    to_dict = lambda m: {
+        "symbol": m.symbol,
+        "name": m.name,
+        "exchange": m.exchange,
+        "quote_type": m.quote_type,
+        "label": m.label,
+    }
+    return (
+        to_dict(resolved) if resolved else None,
+        [to_dict(m) for m in candidates],
+    )
 
 
 def indicator_controls() -> dict:
@@ -182,7 +200,12 @@ with st.sidebar:
     fetch_meta: dict | None = None
 
     if source == "Fetch online":
-        ticker_input = st.text_input("Ticker", value="AAPL").strip().upper()
+        ticker_query = st.text_input(
+            "Ticker or company name",
+            value="AAPL",
+            help="Enter a symbol (AAPL) or a company name (Apple). "
+            "Ambiguous names show a match picker.",
+        ).strip()
         fetch_preset = st.selectbox(
             "History to download",
             list(TIMEFRAME_OFFSETS) + ["Custom"],
@@ -198,24 +221,97 @@ with st.sidebar:
         do_fetch = st.button("Fetch", type="primary", use_container_width=True)
         save_local = st.checkbox("Also save CSV to data/", value=False)
 
-        if do_fetch or st.session_state.get("last_fetch"):
-            if do_fetch:
-                if not ticker_input:
-                    st.error("Enter a ticker symbol.")
-                    st.stop()
-                try:
-                    start, end = resolve_date_range(fetch_preset, fetch_start, fetch_end)
-                except ValueError as exc:
-                    st.error(str(exc))
-                    st.stop()
+        pending = st.session_state.get("pending_ticker_pick")
+        if pending and pending.get("query") == ticker_query:
+            options = pending["candidates"]
+            labels = [c["label"] for c in options]
+            picked_label = st.selectbox(
+                "Multiple matches — pick a symbol",
+                labels,
+                key="ticker_pick_select",
+            )
+            if st.button(
+                "Use selected symbol",
+                type="primary",
+                use_container_width=True,
+                key="ticker_pick_confirm",
+            ):
+                chosen = next(c for c in options if c["label"] == picked_label)
                 st.session_state["last_fetch"] = {
-                    "ticker": ticker_input,
-                    "start": start,
-                    "end": end,
-                    "interval": interval,
-                    "save": save_local,
+                    **pending["fetch_params"],
+                    "ticker": chosen["symbol"],
+                    "resolved_label": chosen["label"],
                 }
+                st.session_state["do_save_csv"] = bool(
+                    pending["fetch_params"].get("save")
+                )
+                st.session_state.pop("pending_ticker_pick", None)
+                st.rerun()
 
+        if do_fetch:
+            if not ticker_query:
+                st.error("Enter a ticker symbol or company name.")
+                st.stop()
+            try:
+                start, end = resolve_date_range(fetch_preset, fetch_start, fetch_end)
+            except ValueError as exc:
+                st.error(str(exc))
+                st.stop()
+
+            fetch_params = {
+                "start": start,
+                "end": end,
+                "interval": interval,
+                "save": save_local,
+            }
+            try:
+                resolved, candidates = cached_resolve_ticker(ticker_query)
+            except Exception as exc:
+                st.error(str(exc))
+                st.stop()
+
+            if resolved:
+                st.session_state.pop("pending_ticker_pick", None)
+                st.session_state["last_fetch"] = {
+                    **fetch_params,
+                    "ticker": resolved["symbol"],
+                    "resolved_label": resolved["label"],
+                }
+                st.session_state["do_save_csv"] = save_local
+            elif candidates:
+                st.session_state["pending_ticker_pick"] = {
+                    "query": ticker_query,
+                    "candidates": candidates,
+                    "fetch_params": fetch_params,
+                }
+                st.rerun()
+            elif looks_like_ticker(ticker_query):
+                symbol = ticker_query.upper()
+                st.session_state.pop("pending_ticker_pick", None)
+                st.session_state["last_fetch"] = {
+                    **fetch_params,
+                    "ticker": symbol,
+                    "resolved_label": symbol,
+                }
+                st.session_state["do_save_csv"] = save_local
+            else:
+                st.session_state.pop("pending_ticker_pick", None)
+                st.error(
+                    f"No ticker found for “{ticker_query}”. "
+                    "Try a different company name or enter a symbol directly."
+                )
+                st.stop()
+
+        if (
+            st.session_state.get("pending_ticker_pick")
+            and st.session_state["pending_ticker_pick"].get("query") == ticker_query
+        ):
+            st.info(
+                f"Found {len(st.session_state['pending_ticker_pick']['candidates'])} "
+                f"matches for “{ticker_query}”. Pick one above, then confirm."
+            )
+
+        if st.session_state.get("last_fetch"):
             meta = st.session_state["last_fetch"]
             try:
                 df_full = cached_fetch(
@@ -231,7 +327,10 @@ with st.sidebar:
 
             ticker_name = meta["ticker"]
             fetch_meta = meta
-            if do_fetch and meta.get("save"):
+            resolved_label = meta.get("resolved_label")
+            if resolved_label and resolved_label != ticker_name:
+                st.caption(f"Resolved: {resolved_label}")
+            if st.session_state.pop("do_save_csv", False) and meta.get("save"):
                 path = save_csv(
                     df_full, meta["ticker"], meta["start"], meta["end"], meta["interval"]
                 )
